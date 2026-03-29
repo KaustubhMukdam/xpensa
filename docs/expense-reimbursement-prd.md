@@ -234,7 +234,7 @@ FastAPI is an excellent choice: async-first, auto-generates OpenAPI docs, and pa
 | **DB Migrations** | Alembic | Schema versioning; auto-generates migration files from SQLModel models |
 | **Auth** | JWT (python-jose) + OAuth2PasswordBearer | FastAPI's built-in OAuth2 flow; role claims embedded in JWT payload |
 | **Password Hashing** | passlib (bcrypt) | Industry-standard password security |
-| **File Storage** | Cloudinary / AWS S3 | Receipt image storage; pre-signed URLs for secure upload/download |
+| **File Storage** | Local/Supabase | Receipt image storage; pre-signed URLs for secure upload/download |
 | **OCR Engine** | EasyOCR (Python) | GPU-optional, multi-language receipt OCR; runs as a background task |
 | **Background Tasks** | FastAPI BackgroundTasks (hackathon) / Celery + Redis (scale) | Async OCR processing + email dispatch |
 | **Email** | FastAPI-Mail + SendGrid / SMTP | New user password emails, approval step notifications |
@@ -273,7 +273,7 @@ ApprovalRecord  → id, expense_id, approver_id, action, comment, timestamp, exc
 | Cache / Broker | Redis |
 | Auth | JWT + OAuth2 (python-jose + passlib) |
 | OCR | EasyOCR |
-| File Storage | Cloudinary / AWS S3 |
+| File Storage | Local/Supabase |
 | Email | FastAPI-Mail + SendGrid |
 | Containerization | Docker + Docker Compose |
 
