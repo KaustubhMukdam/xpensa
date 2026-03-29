@@ -1,13 +1,23 @@
 """
-ocr_service.py — Receipt OCR pipeline for xpensa.
+app/services/ocr_service.py — Receipt OCR pipeline for xpensa.
 
-Uses the Anthropic Claude API (vision) to extract structured data from receipt images.
-This replaces EasyOCR to avoid heavy model downloads on Render's free tier.
+Uses pytesseract (Google Tesseract OCR) — completely FREE, no API key needed.
+
+Requirements (add to requirements.txt):
+  pytesseract==0.3.13
+  Pillow==11.1.0
+
+System dependency (add to Dockerfile or Render build):
+  apt-get install -y tesseract-ocr
+
+Render.com: add a render.yaml build step or use a Dockerfile.
+  Dockerfile example:
+    RUN apt-get update && apt-get install -y tesseract-ocr && rm -rf /var/lib/apt/lists/*
 
 Flow:
   1. Employee uploads receipt image → POST /api/v1/ocr/extract
   2. Image is saved to Supabase Storage → returns { task_id, receipt_url }
-  3. BackgroundTask runs Claude vision → extracts fields
+  3. BackgroundTask runs Tesseract OCR → extracts fields via regex
   4. Employee polls GET /api/v1/ocr/status/{task_id} until status == "done"
   5. Frontend auto-fills the expense form with extracted data
 
@@ -20,21 +30,19 @@ Extracted fields:
 """
 
 import uuid
-import base64
-import time
 import re
+import time
+import io
 from datetime import datetime
 from typing import Optional
 import httpx
 
 # ── In-memory task store (TTL: 10 minutes) ───────────────────────────────────
-# { task_id: { "status": "processing|done|error", "result": {...}, "created_at": float } }
 _tasks: dict[str, dict] = {}
 _TASK_TTL = 600  # 10 minutes
 
 
 def _cleanup_old_tasks() -> None:
-    """Remove tasks older than TTL to prevent memory leak."""
     now = time.time()
     expired = [k for k, v in _tasks.items() if now - v["created_at"] > _TASK_TTL]
     for k in expired:
@@ -42,7 +50,6 @@ def _cleanup_old_tasks() -> None:
 
 
 def create_task() -> str:
-    """Create a new task and return its ID."""
     _cleanup_old_tasks()
     task_id = str(uuid.uuid4())
     _tasks[task_id] = {
@@ -55,7 +62,6 @@ def create_task() -> str:
 
 
 def get_task(task_id: str) -> Optional[dict]:
-    """Get task state. Returns None if not found or expired."""
     task = _tasks.get(task_id)
     if not task:
         return None
@@ -77,124 +83,297 @@ def _set_task_error(task_id: str, error: str) -> None:
         _tasks[task_id]["error"] = error
 
 
-# ── Claude Vision OCR ─────────────────────────────────────────────────────────
+# ── Tesseract OCR Pipeline ────────────────────────────────────────────────────
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+def _preprocess_image(image_bytes: bytes) -> "Image.Image":  # type: ignore[name-defined]
+    """
+    Preprocess the image for better OCR accuracy:
+    - Convert to grayscale
+    - Increase contrast
+    - Resize if too small
+    """
+    try:
+        from PIL import Image, ImageEnhance, ImageFilter
+    except ImportError:
+        raise RuntimeError("Pillow is not installed. Add 'Pillow==11.1.0' to requirements.txt")
 
-# Instructions for Claude to extract receipt data
-_SYSTEM_PROMPT = """You are a receipt data extractor. Extract structured information from receipt images.
+    img = Image.open(io.BytesIO(image_bytes))
 
-Always respond with ONLY a valid JSON object, no markdown, no explanation. Use this exact schema:
-{
-  "amount": <number, the total amount paid>,
-  "currency": "<3-letter ISO 4217 code, infer from receipt symbols: ₹=INR, $=USD, €=EUR, £=GBP>",
-  "date": "<YYYY-MM-DD format>",
-  "description": "<merchant name and brief purpose, max 100 chars>",
-  "category": "<one of: travel, meals, equipment, accommodation, miscellaneous>"
+    # Convert to RGB if RGBA/palette mode
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    # Resize if too small (Tesseract works better with larger images)
+    min_dim = 1000
+    w, h = img.size
+    if w < min_dim or h < min_dim:
+        scale = min_dim / min(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    # Convert to grayscale
+    img = img.convert("L")
+
+    # Enhance contrast
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(2.0)
+
+    # Mild sharpening
+    img = img.filter(ImageFilter.SHARPEN)
+
+    return img
+
+
+def _extract_text_from_image(image_bytes: bytes) -> str:
+    """Run Tesseract OCR and return extracted text."""
+    try:
+        import pytesseract
+    except ImportError:
+        raise RuntimeError(
+            "pytesseract is not installed. Add 'pytesseract==0.3.13' to requirements.txt "
+            "and install tesseract-ocr system package."
+        )
+
+    img = _preprocess_image(image_bytes)
+
+    # Use page segmentation mode 6 (uniform block of text — good for receipts)
+    config = "--psm 6 -l eng"
+    text = pytesseract.image_to_string(img, config=config)
+    return text
+
+
+# ── Amount extraction ─────────────────────────────────────────────────────────
+
+# Currency symbol → ISO code mapping
+_SYMBOL_MAP = {
+    "₹": "INR", "rs": "INR", "rs.": "INR", "inr": "INR",
+    "$": "USD", "usd": "USD",
+    "€": "EUR", "eur": "EUR",
+    "£": "GBP", "gbp": "GBP",
+    "¥": "JPY", "jpy": "JPY", "cny": "CNY",
+    "a$": "AUD", "aud": "AUD",
+    "c$": "CAD", "cad": "CAD",
+    "s$": "SGD", "sgd": "SGD",
+    "chf": "CHF", "aed": "AED", "sar": "SAR", "qar": "QAR",
+    "brl": "BRL", "mxn": "MXN", "krw": "KRW", "thb": "THB",
+    "myr": "MYR", "php": "PHP", "nzd": "NZD", "hkd": "HKD",
 }
 
-Rules:
-- amount: extract the TOTAL (final amount paid, including tax). If unclear, use the largest amount shown.
-- currency: infer from currency symbols, country context, or receipt header. Default to USD if unknown.
-- date: use the transaction/receipt date. If year is ambiguous, use current year.
-- description: include merchant name (e.g. "McDonald's - Team lunch") or "Unknown merchant" if unreadable.
-- category: infer from merchant type (restaurant=meals, airline/cab/hotel=travel/accommodation, etc.)
-- If a field cannot be determined, use: amount=0, currency="USD", date="<today>", description="Receipt", category="miscellaneous"
-"""
+_AMOUNT_PATTERNS = [
+    # "Total: ₹ 1,234.56" or "TOTAL 1234.56"
+    r"(?:total|grand\s*total|amount\s*due|amount\s*paid|net\s*total|subtotal|bill\s*amount)"
+    r"\s*[:\-]?\s*"
+    r"([₹$€£¥]|rs\.?|inr|usd|eur|gbp)?\s*"
+    r"([\d,]+\.?\d*)",
+
+    # "₹ 850" or "$ 42.50" (standalone currency + number)
+    r"([₹$€£¥])\s*([\d,]+\.?\d*)",
+
+    # "1,234.56" (largest standalone number — fallback)
+    r"\b([\d,]{2,}\.?\d{2})\b",
+]
 
 
-async def run_ocr_with_claude(
+def _parse_amount_and_currency(text: str) -> tuple[float, str]:
+    """Extract total amount and currency from OCR text."""
+    text_lower = text.lower()
+
+    # Detect currency from symbols in the full text
+    detected_currency = "USD"
+    for sym, code in _SYMBOL_MAP.items():
+        if sym in text_lower:
+            detected_currency = code
+            break
+
+    # Also check for ISO codes mentioned explicitly
+    for sym, code in _SYMBOL_MAP.items():
+        if len(sym) == 3 and re.search(r"\b" + sym + r"\b", text_lower):
+            detected_currency = code
+            break
+
+    # Try amount patterns from most specific to least
+    amounts: list[float] = []
+    for pattern in _AMOUNT_PATTERNS:
+        for match in re.finditer(pattern, text_lower, re.IGNORECASE):
+            groups = match.groups()
+            # Last group is always the numeric part
+            num_str = groups[-1].replace(",", "")
+            try:
+                amounts.append(float(num_str))
+            except ValueError:
+                pass
+
+    if amounts:
+        # Use the maximum amount found (most likely to be the total)
+        return max(amounts), detected_currency
+
+    return 0.0, detected_currency
+
+
+# ── Date extraction ───────────────────────────────────────────────────────────
+
+_DATE_PATTERNS = [
+    # DD/MM/YYYY or DD-MM-YYYY
+    (r"\b(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})\b", "dmy"),
+    # YYYY/MM/DD or YYYY-MM-DD
+    (r"\b(\d{4})[/\-\.](\d{1,2})[/\-\.](\d{1,2})\b", "ymd"),
+    # DD Month YYYY (e.g. "15 Jan 2024")
+    (r"\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{4})\b", "dmy_text"),
+    # Month DD, YYYY (e.g. "January 15, 2024")
+    (r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2}),?\s+(\d{4})\b", "mdy_text"),
+]
+
+_MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _parse_date(text: str) -> str:
+    """Extract and normalise date from OCR text to YYYY-MM-DD."""
+    text_lower = text.lower()
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    current_year = datetime.utcnow().year
+
+    for pattern, fmt in _DATE_PATTERNS:
+        m = re.search(pattern, text_lower)
+        if not m:
+            continue
+        try:
+            if fmt == "dmy":
+                d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            elif fmt == "ymd":
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            elif fmt == "dmy_text":
+                d = int(m.group(1))
+                mo = _MONTH_MAP.get(m.group(2)[:3], 1)
+                y = int(m.group(3))
+            elif fmt == "mdy_text":
+                mo = _MONTH_MAP.get(m.group(1)[:3], 1)
+                d = int(m.group(2))
+                y = int(m.group(3))
+            else:
+                continue
+
+            # Sanity check
+            if 1 <= mo <= 12 and 1 <= d <= 31 and 2000 <= y <= current_year + 1:
+                return f"{y:04d}-{mo:02d}-{d:02d}"
+        except (ValueError, IndexError):
+            continue
+
+    return today_str
+
+
+# ── Description / merchant extraction ────────────────────────────────────────
+
+def _parse_description(text: str) -> str:
+    """
+    Try to extract a merchant name from the first few non-empty lines.
+    Receipt headers usually contain the merchant name.
+    """
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        return "Receipt"
+
+    # Heuristic: the merchant name is usually in the first 1-3 lines,
+    # is reasonably short, and contains mostly letters.
+    for line in lines[:4]:
+        # Skip lines that look like addresses, phone numbers, or dates
+        if re.search(r"\d{5,}|\b(?:tel|phone|gst|tax|date)\b", line.lower()):
+            continue
+        # Skip lines that are mostly numbers or symbols
+        alpha_ratio = sum(c.isalpha() or c.isspace() for c in line) / max(len(line), 1)
+        if alpha_ratio > 0.5 and len(line) >= 3:
+            return line[:100]  # Cap at 100 chars
+
+    return lines[0][:100] if lines else "Receipt"
+
+
+# ── Category inference ────────────────────────────────────────────────────────
+
+_CATEGORY_KEYWORDS = {
+    "meals": [
+        "restaurant", "cafe", "coffee", "food", "eat", "dining", "bistro",
+        "hotel restaurant", "mcdonalds", "kfc", "pizza", "burger", "sushi",
+        "swiggy", "zomato", "dominos", "subway", "starbucks", "tea", "snack",
+        "canteen", "mess", "tiffin", "lunch", "dinner", "breakfast", "biryani",
+    ],
+    "travel": [
+        "taxi", "cab", "uber", "ola", "auto", "rickshaw", "bus", "train",
+        "flight", "airline", "airport", "boarding", "metro", "subway",
+        "toll", "fuel", "petrol", "diesel", "transport", "parking", "irctc",
+        "indigo", "spicejet", "air india", "makemytrip", "goibibo",
+    ],
+    "accommodation": [
+        "hotel", "inn", "lodge", "resort", "motel", "hostel", "airbnb",
+        "room", "stay", "oyo", "treebo", "fabhotel", "accommodation",
+    ],
+    "equipment": [
+        "electronics", "laptop", "computer", "phone", "mobile", "tablet",
+        "printer", "keyboard", "mouse", "monitor", "headphone", "cable",
+        "office supply", "stationery", "pen", "paper", "ink", "toner",
+        "amazon", "flipkart", "croma", "reliance digital",
+    ],
+}
+
+
+def _infer_category(text: str, description: str) -> str:
+    """Infer expense category from OCR text and description."""
+    combined = (text + " " + description).lower()
+    scores: dict[str, int] = {cat: 0 for cat in _CATEGORY_KEYWORDS}
+
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in combined:
+                scores[category] += 1
+
+    best = max(scores, key=lambda c: scores[c])
+    if scores[best] > 0:
+        return best
+    return "miscellaneous"
+
+
+# ── Main OCR runner ───────────────────────────────────────────────────────────
+
+async def run_ocr_with_tesseract(
     task_id: str,
     image_bytes: bytes,
-    media_type: str,
-    anthropic_api_key: str,
+    media_type: str,  # kept for API compatibility, not used
 ) -> None:
     """
-    Runs Claude vision OCR on the image bytes.
+    Runs Tesseract OCR on the image bytes.
     Updates task state on completion or error.
     Called as a FastAPI BackgroundTask.
     """
     try:
-        # Encode image as base64
-        image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        # Extract raw text
+        raw_text = _extract_text_from_image(image_bytes)
 
-        payload = {
-            "model": "claude-opus-4-5",
-            "max_tokens": 512,
-            "system": _SYSTEM_PROMPT,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": "Extract the receipt data from this image and return only the JSON object.",
-                        },
-                    ],
-                }
-            ],
-        }
+        # Parse fields
+        amount, currency = _parse_amount_and_currency(raw_text)
+        date_str = _parse_date(raw_text)
+        description = _parse_description(raw_text)
+        category = _infer_category(raw_text, description)
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                ANTHROPIC_API_URL,
-                json=payload,
-                headers={
-                    "x-api-key": anthropic_api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        # Extract text from response
-        raw_text = data["content"][0]["text"].strip()
-
-        # Strip any accidental markdown fences
-        raw_text = re.sub(r"```(?:json)?", "", raw_text).strip().rstrip("`").strip()
-
-        import json
-        result = json.loads(raw_text)
-
-        # Validate and sanitise
         today = datetime.utcnow().strftime("%Y-%m-%d")
+
         sanitised = {
-            "amount": float(result.get("amount") or 0),
-            "currency": str(result.get("currency") or "USD").upper()[:3],
-            "date": str(result.get("date") or today),
-            "description": str(result.get("description") or "Receipt")[:200],
-            "category": str(result.get("category") or "miscellaneous").lower(),
+            "amount": round(amount, 2),
+            "currency": currency[:3].upper(),
+            "date": date_str if date_str else today,
+            "description": description[:200] if description else "Receipt",
+            "category": category,
         }
-
-        # Validate date format
-        try:
-            datetime.strptime(sanitised["date"], "%Y-%m-%d")
-        except ValueError:
-            sanitised["date"] = today
-
-        # Validate category
-        valid_categories = {"travel", "meals", "equipment", "accommodation", "miscellaneous"}
-        if sanitised["category"] not in valid_categories:
-            sanitised["category"] = "miscellaneous"
 
         _set_task_done(task_id, sanitised)
 
-    except httpx.HTTPStatusError as e:
-        _set_task_error(task_id, f"Claude API error: {e.response.status_code}")
+    except RuntimeError as e:
+        # pytesseract or PIL not installed
+        _set_task_error(task_id, str(e))
     except Exception as e:
         _set_task_error(task_id, f"OCR failed: {str(e)[:200]}")
 
 
-# ── Supabase Storage upload helper ────────────────────────────────────────────
+# ── Supabase Storage upload helper (unchanged) ────────────────────────────────
 
 async def upload_receipt_to_supabase(
     image_bytes: bytes,
@@ -226,6 +405,5 @@ async def upload_receipt_to_supabase(
         )
         response.raise_for_status()
 
-    # Construct public URL
     public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{path}"
     return public_url
