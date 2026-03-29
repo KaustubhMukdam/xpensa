@@ -5,6 +5,11 @@
 Built for a hackathon. Production-deployed on **Render** (backend) + **Vercel** (frontend).
 
 ---
+## Want to Run the code by yourself:
+First run backend, then frontend
+### Backend: https://xpensa-4kmt.onrender.com/
+### Frontend: https://xpensa-mocha.vercel.app/
+
 
 ## Tech Stack
 
