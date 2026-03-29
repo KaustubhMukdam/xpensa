@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     FROM_NAME: str = "Xpensa"
 
     # CORS
-    FRONTEND_URL: str = "http://localhost:5173"
+    FRONTEND_URL: str = "https://xpensa-mocha.vercel.app"
 
     # Currency
     EXCHANGE_RATE_API_KEY: str = ""
