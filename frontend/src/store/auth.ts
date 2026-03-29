@@ -20,16 +20,56 @@ interface AuthState {
     logout: () => void;
 }
 
-// In-memory store — no localStorage (keeps it simple + secure)
-// Token is lost on page refresh → user must log in again (fine for hackathon)
+// ── sessionStorage keys ───────────────────────────────────────────────────────
+const TOKEN_KEY = "xpensa_token";
+const USER_KEY = "xpensa_user";
+
+// ── Hydrate from sessionStorage on load ──────────────────────────────────────
+// sessionStorage survives page refresh but is cleared when the tab is closed.
+// This is intentionally more secure than localStorage for a JWT auth token.
+function loadPersistedAuth(): { token: string | null; user: AuthUser | null } {
+    try {
+        const token = sessionStorage.getItem(TOKEN_KEY);
+        const userRaw = sessionStorage.getItem(USER_KEY);
+        if (token && userRaw) {
+            const user = JSON.parse(userRaw) as AuthUser;
+            return { token, user };
+        }
+    } catch {
+        // Corrupt data — clear and start fresh
+        sessionStorage.removeItem(TOKEN_KEY);
+        sessionStorage.removeItem(USER_KEY);
+    }
+    return { token: null, user: null };
+}
+
+const persisted = loadPersistedAuth();
+
 export const useAuthStore = create<AuthState>((set) => ({
-    token: null,
-    user: null,
-    isAuthenticated: false,
+    token: persisted.token,
+    user: persisted.user,
+    isAuthenticated: persisted.token !== null,
 
-    setAuth: (token, user) =>
-        set({ token, user, isAuthenticated: true }),
+    setAuth: (token, user) => {
+        // Persist to sessionStorage
+        try {
+            sessionStorage.setItem(TOKEN_KEY, token);
+            sessionStorage.setItem(USER_KEY, JSON.stringify(user));
+        } catch {
+            // sessionStorage might be disabled (e.g. incognito with strict settings)
+            // Silently fall back to in-memory only
+        }
+        set({ token, user, isAuthenticated: true });
+    },
 
-    logout: () =>
-        set({ token: null, user: null, isAuthenticated: false }),
+    logout: () => {
+        // Clear sessionStorage on explicit logout
+        try {
+            sessionStorage.removeItem(TOKEN_KEY);
+            sessionStorage.removeItem(USER_KEY);
+        } catch {
+            // ignore
+        }
+        set({ token: null, user: null, isAuthenticated: false });
+    },
 }));

@@ -19,13 +19,14 @@ app.add_middleware(
 )
 
 # ─── Routers ──────────────────────────────────────────────────────────────────
-from app.routers import auth, users, approval_rules, expenses, approvals  # noqa: E402
+from app.routers import auth, users, approval_rules, expenses, approvals, ocr  # noqa: E402
 
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Auth"])
 app.include_router(users.router, prefix="/api/v1/users", tags=["Users"])
 app.include_router(approval_rules.router, prefix="/api/v1/approval-rules", tags=["Approval Rules"])
 app.include_router(expenses.router, prefix="/api/v1/expenses", tags=["Expenses"])
 app.include_router(approvals.router, prefix="/api/v1/approvals", tags=["Approvals"])
+app.include_router(ocr.router, prefix="/api/v1/ocr", tags=["OCR"])
 
 
 # ─── Health Check ─────────────────────────────────────────────────────────────
